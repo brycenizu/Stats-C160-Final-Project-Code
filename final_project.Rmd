@@ -1,0 +1,351 @@
+---
+title: "final_project"
+output: html_document
+---
+
+```{r Needed Files from the MIMIC Data}
+# - chartevents.csv-003
+# from mimic 2 hosp folder
+# - patients.csv
+# - admissions.csv
+# - diagnoses_icd.csv
+# from mimic 2 icu folder
+# - icustays.csv
+# - d_items.csv
+```
+
+```{r 1 Data Loading}
+library(data.table)
+
+patients <- fread("/Users/brycen.izu/stats c160/mimic-iv-2.2 2/hosp/patients.csv")
+admissions <- fread("/Users/brycen.izu/stats c160/mimic-iv-2.2 2/hosp/admissions.csv")
+diagnoses <- fread("/Users/brycen.izu/stats c160/mimic-iv-2.2 2/hosp/diagnoses_icd.csv")
+icustays <- fread("/Users/brycen.izu/stats c160/mimic-iv-2.2 2/icu/icustays.csv")
+
+# Star with icustays
+
+data <- icustays
+
+# Merge admissions
+data <- merge(
+  data,
+  admissions[, .(subject_id, hadm_id, hospital_expire_flag, admission_type)],
+  by = c("subject_id", "hadm_id")
+)
+
+data[, death := hospital_expire_flag == 1]
+
+# Merge patients
+data <- merge(data, patients[, .(subject_id, anchor_age, gender)],
+              by = "subject_id")
+data[, age := anchor_age]
+
+# Merge diagnoses
+# install.packages("comorbidity")
+library(comorbidity)
+
+diag9  <- diagnoses[icd_version == 9]
+diag10 <- diagnoses[icd_version == 10]
+
+elix9 <- comorbidity(
+  x = diag9,
+  id = "hadm_id",
+  code = "icd_code",
+  map = "elixhauser_icd9_quan",
+  assign0 = TRUE
+)
+
+elix10 <- comorbidity(
+  x = diag10,
+  id = "hadm_id",
+  code = "icd_code",
+  map = "elixhauser_icd10_quan",
+  assign0 = TRUE
+)
+
+comorb_names <- union(
+  setdiff(names(elix9), "hadm_id"),
+  setdiff(names(elix10), "hadm_id")
+)
+
+setDT(elix9)
+setDT(elix10)
+
+elix <- merge(elix9, elix10, by = "hadm_id", all = TRUE, suffixes = c("_9", "_10"))
+setDT(elix)
+
+for (nm in comorb_names) {
+  c9 <- paste0(nm, "_9")
+  c10 <- paste0(nm, "_10")
+  
+  if (!c9 %in% names(elix)) elix[, (c9) := 0]
+  if (!c10 %in% names(elix)) elix[, (c10) := 0]
+  
+  elix[, (nm) := pmax(get(c9), get(c10), na.rm = TRUE)]
+}
+
+elix <- elix[, c("hadm_id", comorb_names), with = FALSE]
+
+data <- merge(data, elix, by = "hadm_id", all.x = TRUE)
+
+for (nm in comorb_names) {
+  data[is.na(get(nm)), (nm) := 0]
+}
+
+# Merge d_items
+items <- fread("/Users/brycen.izu/stats c160/mimic-iv-2.2 2/icu/d_items.csv")
+items[grep("height|weight", label, ignore.case=TRUE)]
+
+# Merge chartevents
+weight_id <- c(226512)
+height_id <- c(226730)
+
+chart <- fread(
+  "chartevents.csv-003",
+  select = c("subject_id","hadm_id","itemid","valuenum")
+)
+
+hw <- chart[itemid %in% c(weight_id, height_id)]
+
+weight <- hw[itemid %in% weight_id,
+             .(subject_id, hadm_id, weight = valuenum)]
+
+height <- hw[itemid %in% height_id,
+             .(subject_id, hadm_id, height = valuenum)]
+
+weight <- weight[weight >= 30 & weight <= 300]
+height <- height[height >= 120 & height <= 230]
+
+weight_one <- weight[!is.na(weight),
+  .(weight = median(weight, na.rm = TRUE)),
+  by = .(subject_id, hadm_id)
+]
+
+height_one <- height[!is.na(height),
+  .(height = median(height, na.rm = TRUE)),
+  by = .(subject_id, hadm_id)
+]
+
+bmi_data <- merge(weight_one, height_one, by = c("subject_id", "hadm_id"))
+
+bmi_data[, height_m := height / 100]
+bmi_data[, bmi_all := weight / (height_m^2)]
+
+data <- merge(
+  data,
+  bmi_data[, .(subject_id, hadm_id, bmi_all)],
+  by = c("subject_id", "hadm_id"),
+  all.x = TRUE
+)
+
+setorder(data, subject_id, hadm_id, intime)
+data <- data[, .SD[1], by = .(subject_id, hadm_id)]
+```
+
+```{r 2 Selecting Cohort & Generating Data}
+data <- data[complete.cases(data[, .(death, bmi_all, age)])]
+
+data <- data[bmi_all >= 18.5 & bmi_all < 35]
+
+# Add Treatment variable
+data[, treat := as.integer(bmi_all >= 25)]
+
+comorb_vars <- intersect(comorb_names, names(data))
+
+for (var in comorb_vars) {
+  data[is.na(get(var)), (var) := 0]
+}
+
+keep_vars <- c("bmi_all", "treat", "death", "age", "gender")
+data <- data[complete.cases(data[, ..keep_vars])]
+
+# Prepare sex and death for modeling
+data[, sex := fifelse(gender %in% c("M", "Male"), 1L, 0L)]
+data[, death := as.integer(death)]
+
+data[, admission_type := as.factor(admission_type)]
+adm_mat <- model.matrix(~ admission_type - 1, data = data)
+
+data[, c("obes", "wloss") := NULL]
+
+comorb_vars <- setdiff(comorb_vars, c("obes", "wloss"))
+
+data[, diab := pmax(diabunc, diabc)]
+data[, c("diabunc", "diabc") := NULL]
+
+comorb_vars <- setdiff(comorb_vars, c("diabunc", "diabc"))
+comorb_vars <- union(comorb_vars, "diab")
+
+data[, comorbidity_burden := rowSums(.SD), .SDcols = comorb_vars]
+```
+
+```{r 3 Inspecting Heterogeneity}
+library(grf)
+
+covars_num <- c("age", "sex", comorb_vars)
+
+X <- cbind(as.matrix(data[, ..covars_num]), adm_mat)
+Y <- as.numeric(data$death)
+W <- data$treat
+
+crf <- causal_forest(
+  X = X,
+  Y = Y,
+  W = W
+)
+
+data[, cate := predict(crf)$predictions]
+```
+
+```{r 3.1 TE Measure}
+ate <- mean(data$cate)
+ate
+
+round(ate, 4)
+```
+
+The treatment decreases mortality probability by 0.0111 on average.
+
+```{r 3.2 ETT}
+# 3.2.1 Comparing the treated and untreated groups
+
+library(ggplot2)
+
+# compare the age distribution
+ggplot(data, aes(x = age, color = factor(treat))) +
+  stat_ecdf() +
+  theme_bw() +
+  scale_color_discrete(name = "BMI group",
+                       labels = c("BMI < 25", "BMI >= 25"))
+
+# compare the comorbidity_burden distribution
+ggplot(data, aes(x = comorbidity_burden, color = factor(treat))) +
+  stat_ecdf() +
+  theme_bw() +
+  scale_color_discrete(name = "BMI group",
+                       labels = c("BMI < 25", "BMI >= 25"))
+
+# 3.2.2 ETT computation
+
+etts <- data[, .(ett = mean(cate)), by = treat]
+etts
+```
+
+We conclude that the age distributions of patients with BMI < 25 and BMI ≥ 25 are fairly similar overall.
+
+We conclude that comorbidity burden appears very similar between the two BMI groups, with no obvious meaningful difference.  
+
+For patients with BMI ≥ 25, the estimated treatment effect is approximately -0.0118, corresponding to about a 1.18 percentage point decrease in mortality probability. For patients with BMI < 25, the estimated treatment effect is approximately -0.0098, corresponding to about a 0.98 percentage point decrease in mortality probability.
+
+```{r 3.3 z-TE(s)}
+comorbidity_burden_te <- data[, list(
+  zte = mean(cate),
+  dev = sd(cate) / sqrt(.N),
+  cnt = .N
+), by = comorbidity_burden]
+
+ggplot(comorbidity_burden_te[cnt > 10], aes(x = comorbidity_burden, y = zte)) + 
+  geom_point() +
+  geom_line() +
+  geom_ribbon(aes(
+    ymin = zte - 1.96 * dev,
+    ymax = zte + 1.96 * dev
+  ), alpha = 0.3) +
+  theme_bw() +
+  labs(
+    x = "Comorbidity Burden",
+    y = "Estimated Effect of BMI on Mortality"
+  )
+
+sex_te <- data[, .(
+  zte = mean(cate),
+  dev = sd(cate) / sqrt(.N),
+  cnt = .N
+), by = sex]
+
+ggplot(sex_te, aes(x = factor(sex), y = zte)) +
+  geom_point() +
+  geom_errorbar(aes(
+    ymin = zte - 1.96 * dev,
+    ymax = zte + 1.96 * dev
+  ), width = 0.1) +
+  theme_bw() +
+  labs(
+    x = "Sex (0 = Female, 1 = Male)",
+    y = "Estimated Effect of BMI on Mortality"
+  )
+
+adm_te <- data[, .(
+  zte = mean(cate),
+  dev = sd(cate) / sqrt(.N),
+  cnt = .N
+), by = admission_type]
+
+ggplot(adm_te[cnt > 10], aes(x = reorder(admission_type, zte), y = zte)) +
+  geom_point() +
+  geom_errorbar(aes(
+    ymin = zte - 1.96 * dev,
+    ymax = zte + 1.96 * dev
+  ), width = 0.1) +
+  coord_flip() +
+  theme_bw() +
+  labs(
+    x = "Admission Type",
+    y = "Estimated Effect of BMI on Mortality"
+  )
+
+decile_heterogeneity <- function(var, data) {
+  
+  qs <- quantile(data[[var]], seq(0, 1, 0.1), na.rm = TRUE)
+  qs <- unique(qs)
+  
+  data[, dec := .bincode(get(var), qs, include.lowest = TRUE)]
+  
+  z_te <- data[!is.na(dec), .(
+    zte = mean(cate),
+    dev = sd(cate) / sqrt(.N),
+    cnt = .N
+  ), by = dec]
+  
+  ggplot(z_te[cnt > 5], aes(x = dec, y = zte)) +
+    geom_point() +
+    geom_line() +
+    geom_ribbon(aes(
+      ymin = zte - 1.96 * dev,
+      ymax = zte + 1.96 * dev
+    ), alpha = 0.3) +
+    theme_bw() +
+    labs(
+      x = paste(var, "decile"),
+      y = "Estimated effect of BMI on mortality"
+    )
+}
+
+decile_heterogeneity("age", data)
+
+data[, treat30 := as.integer(bmi_all >= 30)]
+
+crf30 <- causal_forest(
+  X = X,
+  Y = as.numeric(data$death),
+  W = data$treat30
+)
+
+mean(predict(crf30)$predictions)
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
