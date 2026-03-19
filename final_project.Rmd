@@ -330,8 +330,6 @@ crf30 <- causal_forest(
   Y = as.numeric(data$death),
   W = data$treat30
 )
-
-mean(predict(crf30)$predictions)
 ```
 
 
